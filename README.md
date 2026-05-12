@@ -9,8 +9,8 @@ Because the technologies involved in RDMA networking can be complex, this projec
 
 - [RDMA Fundamentals](docs/01_README_RDMA.md): Introduction to Remote Direct Memory Access - kernel bypass, zero-copy transfers, and the verbs programming model.
 - [InfiniBand Architecture](docs/02_README_INFINIBAND.md): Deep dive into the InfiniBand protocol - subnet management, queue pairs, transport services, and hardware-driven reliability.
-- [RoCE (RDMA over Converged Ethernet)](docs/04_README_ROCE.md): How RDMA is carried over standard Ethernet using RoCEv1 and RoCEv2, the lossless fabric requirements this introduces, and the MRC protocol that extends RC with multipath operation for large-scale AI training.
-- [Data Center Network Adapters](docs/04a_README_NIC_ECOSYSTEM.md): The evolution of network offload — from standard NICs and SmartNICs through HCAs and DPUs to the AI-era SuperNICs that implement MRC and multipath transport in hardware.
+- [RoCE (RDMA over Converged Ethernet)](docs/03_README_ROCE.md): How RDMA is carried over standard Ethernet using RoCEv1 and RoCEv2, and the lossless fabric requirements this introduces.
+- [Data Center Network Adapters](docs/04_README_NIC_ECOSYSTEM.md): The evolution of network offload — from standard NICs and SmartNICs through HCAs and DPUs to the AI-era SuperNICs that implement MRC and multipath transport in hardware.
 
 ## Testbed Overview
 
@@ -29,8 +29,8 @@ The NICs on both workstations are connected **point-to-point** in matched pairs:
 
 This symmetric topology allows us to benchmark and compare all three RDMA transport paths on the same physical testbed, under controlled point-to-point conditions with no switching fabric in the path.
 
-- [Lab Setup](docs/07_README_SETUP.md): Hardware specifications, OS installation, and OFED driver deployment for both workstations.
-- [ConnectX-4 Configuration](docs/08_README_SETUP_CX_4.md): Detailed guide to the Mellanox MCX455A-ECAT - firmware configuration, VPI mode switching, and port provisioning.
+- [Lab Setup](docs/05_README_SETUP.md): Hardware specifications, OS installation, and OFED driver deployment for both workstations.
+- [ConnectX-4 Configuration](docs/06_README_SETUP_CX_4.md): Detailed guide to the Mellanox MCX455A-ECAT - firmware configuration, VPI mode switching, and port provisioning.
 
 The VPI (Virtual Protocol Interconnect) designation means each ConnectX-4 port can be configured at the firmware level to operate in either InfiniBand mode or Ethernet mode. This is a per-port setting burned into the card's non-volatile memory. Because each link is point-to-point, both ends of a given pair **must** be configured to the same protocol: an InfiniBand port cannot negotiate a link with an Ethernet port. In our testbed, CX-4 #1 on both workstations is set to InfiniBand mode for native RDMA, while CX-4 #2 on both workstations is set to Ethernet mode for RoCEv2.
 
@@ -38,11 +38,10 @@ The VPI (Virtual Protocol Interconnect) designation means each ConnectX-4 port c
 
 Once the testbed is up and running, and before writing our own custom RDMA applications, it is useful to perform a series of connectivity and performance tests across each link. These exercises help verify that the hardware, drivers, and protocols are functioning correctly, and build practical familiarity with the tools and workflows used throughout the rest of the project.
 
-- [InfiniBand Testing](docs/09_README_INFINIBAND_TEST.md): Verifying HCA state with `ibstat`, running diagnostics, and validating point-to-point InfiniBand connectivity.
-- [IP over InfiniBand](docs/10_README_IP_Over_INFINIBAND.md): Configuring IPoIB interfaces and understanding how the Linux networking stack exposes InfiniBand ports.
-- [RoCEv2 Testing](docs/11_README_ROCEv2_TEST.md): Switching CX-4 to Ethernet mode, configuring RoCEv2, and running RDMA traffic over 100 GbE.
-- [Soft-RoCE](docs/12_README_SOFT_ROCE.md): Setting up software-emulated RoCEv2 (RXE) on a standard Ethernet NIC for development and testing without RDMA hardware.
-- [PFC and RoCE Tuning](docs/README_PFC_TEST.md): ETS scheduling, MTU sizing, incast scenarios, and PFC tuning for RoCE deployments.
+- [InfiniBand Testing](docs/07_README_INFINIBAND_TEST.md): Verifying HCA state with `ibstat`, running diagnostics, and validating point-to-point InfiniBand connectivity.
+- [IP over InfiniBand](docs/08_README_IP_Over_INFINIBAND.md): Configuring IPoIB interfaces and understanding how the Linux networking stack exposes InfiniBand ports.
+- [RoCEv2 Testing](docs/09_README_ROCEv2_TEST.md): Switching CX-4 to Ethernet mode, configuring RoCEv2, and running RDMA traffic over 100 GbE.
+- [Soft-RoCE](docs/10_README_SOFT_ROCE.md): Setting up software-emulated RoCEv2 (RXE) on a standard Ethernet NIC for development and testing without RDMA hardware.
 
 ## Language Choice
 
