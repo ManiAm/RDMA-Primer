@@ -186,6 +186,10 @@ The most common software-level approach to improving RoCEv2 load balancing is **
 
 For example, if a single 400 Gb/s transfer is split across 4 QPs, each QP carries approximately 100 Gb/s and hashes independently. The probability that all four collide on the same link drops significantly compared to a single QP.
 
+Meta deployed QP scaling across their production AI training clusters and measured its impact on AllReduce bandwidth. The figure below (from [Meta's SIGCOMM 2024 paper](https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/)) compares two strategies — splitting each message across multiple QPs versus posting successive messages to different QPs in round-robin fashion — at QP counts of 1, 4, and 16. Round-robin with 16 QPs achieves near-100% normalized bandwidth for large messages (2 GB), while a single QP (the "out of box" baseline) reaches only ~60%. The improvement is most pronounced for large messages where elephant flows dominate; for small messages (2–8 MB), even 16 QPs provide limited benefit because the transfers are too short to create sustained congestion.
+
+<img src="../pics/qp-scaling-meta.png" width="550"/>
+
 However, QP scaling has practical limits:
 
 - **Diminishing returns**: Experiments show negligible improvement beyond 8–16 QPs. With more QPs, the probability of *some* collision remains high (birthday paradox with more draws), and the overhead of managing additional QPs increases.
