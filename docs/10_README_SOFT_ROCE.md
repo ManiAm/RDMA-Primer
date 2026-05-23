@@ -1,59 +1,58 @@
 
 # Software RoCE (Soft-RoCE)
 
-Software RoCE (often referred to in Linux as RXE or rdma_rxe) is a software implementation of the RoCEv2 protocol.
-
-Normally, RDMA requires a specialized hardware RNIC (like a ConnectX-4) to physically handle complex transport logic and memory mapping without CPU involvement. Soft-RoCE allows you to emulate this capability on any standard, non-RDMA Ethernet adapter. It provides the exact same API (verbs) to applications, making it highly valuable for testing, development, or running RDMA-dependent distributed storage in environments without physical RNICs.
+Software RoCE (referred to in Linux as RXE or `rdma_rxe`) is a software implementation of the RoCEv2 protocol. It allows any standard Ethernet NIC to expose the same RDMA Verbs API that hardware RNICs provide, making it useful for development, testing, or running RDMA-dependent applications without specialized hardware.
 
 <img src="../pics/soft-roce-2.png" width="450"/>
 
-Hardware RoCE Path (Right): Traffic moves from the application through the hardware RoCE drivers directly to the specialized RoCE HCA (Host Channel Adapter). This path completely bypasses the main host NIC driver and generic Ethernet controller, achieving true kernel bypass.
+**Hardware RoCE Path (Right):** Traffic moves from the application through the hardware RoCE drivers directly to the RoCE HCA. This path bypasses the kernel networking stack entirely.
 
-Soft-RoCE Path (Center, red ovals): The application's RDMA call is intercepted by the Soft-RoCE user driver. This driver, along with the Soft-RoCE kernel driver (rdma_rxe), implements all the complex RoCE transport logic (Verbs, UDP, IP) entirely in software. Crucially, this emulated logic is packaged and sent down to the standard NIC driver—the exact same OS-level driver used by standard TCP/IP sockets. The final destination is a standard Ethernet NIC.
+**Soft-RoCE Path (Center, red ovals):** The application's RDMA call is handled by the `rdma_rxe` kernel module, which implements all RoCE transport logic (Verbs, UDP/IP encapsulation) in software. The resulting packets are handed to the standard kernel network stack and transmitted through a regular Ethernet NIC.
 
 | Feature           | Hardware RoCEv2 (ConnectX-4)                               | Software RoCE (rdma_rxe)                               |
 | ----------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
 | Data Path         | NIC hardware directly accesses application memory (RDMA).  | Application → `rdma_rxe` → kernel network stack → NIC. |
 | Kernel Bypass     | Yes                                                        | No (CPU and kernel process all traffic)                |
-| Capture Interface | RDMA device                                                | Standard Ethernet interface                            |
-| Required Tooling  | OFED-aware tools (e.g., tcpdump via Mellanox/NVIDIA stack) | Native tools (e.g., tcpdump, Wireshark)                |
+| Capture Interface | RDMA device (requires special tooling)                     | Standard Ethernet interface (native tcpdump)           |
+| Performance       | Line-rate (84+ Gb/s at 100GbE)                             | CPU-bound (~110 MB/s on 1GbE)                          |
 
-## Configuring Soft-RoCE
+## Prerequisites
 
-To configure Soft-RoCE any standard Ethernet NIC will work (onboard, Intel, Realtek, USB adapter, etc.). The only requirement is a Linux kernel with the `rdma_rxe` module (included in mainline since kernel 4.9) and basic IP connectivity between the two machines. We will use our `Intel I210-AT` ethernet NIC card installed on each workstation.
+Soft-RoCE requires:
+- A Linux kernel with the `rdma_rxe` module (mainline since 4.9)
+- Any standard Ethernet NIC with IP connectivity between nodes
+- RDMA user-space tools (`rdma-core`, `ibverbs-utils`, `perftest`)
 
-We will configure one Soft-RoCE device per workstation, binding the software `rxe0` device to the physical Ethernet interface.
+This lab uses an Intel I210-AT PCIe x1 NIC (1GbE) on each workstation, connected via a standard Cat6 Ethernet cable. See [Hardware Setup](05_README_SETUP.md) for NIC placement details.
+
+## Configuration
+
+### Target Setup
 
 | Machine | Interface | Soft-RoCE Device | IP Address |
 | ------- | --------- | ---------------- | ---------- |
 | rdma1   | enp7s0    | rxe0             | 10.20.0.1  |
 | rdma2   | enp7s0    | rxe0             | 10.20.0.3  |
 
-Before configuring the kernel, we need the user-space tools to manage RDMA devices.
+### Installing User-Space Tools
 
-Run this on both rdma1 and rdma2:
+On both workstations:
 
     sudo apt update
     sudo apt install -y rdma-core ibverbs-utils perftest libibverbs-dev rdmacm-utils
 
-We will load `rdma_rxe` kernel module into the current session and then add it to the `modules-load.d` directory so it automatically loads on all future reboots.
+### Loading the Kernel Module
 
-Run this on both rdma1 and rdma2:
+Load `rdma_rxe` and make it persistent across reboots:
 
     sudo modprobe rdma_rxe
     echo "rdma_rxe" | sudo tee /etc/modules-load.d/rdma_rxe.conf
 
-Using `ip addr add` is temporary and will vanish upon reboot. Because we are using Ubuntu, we will use Netplan to make the IP addresses persistent.
+### Persistent IP Addressing (Netplan)
 
-On rdma1:
+The `ip addr add` command is temporary. On Ubuntu, use Netplan to make addresses persist across reboots.
 
-Create the following Netplan configuration file:
-
-    sudo nano /etc/netplan/99-rdma.yaml
-
-We use the 99-rdma.yaml naming convention because Netplan processes configuration files in numerical order, applying the highest-numbered files last. If there are overlapping configurations, the settings in the last loaded file will overwrite the others. By prefixing our custom configuration with `99-`, we guarantee that our settings take absolute priority and will not be accidentally overridden by the operating system's default network files (such as 50-cloud-init.yaml).
-
-Paste the following, ensuring the indentation is exactly as shown (YAML is strictly space-sensitive):
+On **rdma1**, create `/etc/netplan/99-rdma.yaml`:
 
 ```yaml
 network:
@@ -64,21 +63,7 @@ network:
         - 10.20.0.1/24
 ```
 
-Set the correct permission:
-
-    sudo chmod 600 /etc/netplan/99-rdma.yaml
-
-Apply the changes:
-
-    sudo netplan apply
-
-On rdma2:
-
-Create the same file, but use the .3 address:
-
-    sudo nano /etc/netplan/99-rdma.yaml
-
-Paste the following, ensuring the indentation is exactly as shown (YAML is strictly space-sensitive):
+On **rdma2**, create `/etc/netplan/99-rdma.yaml`:
 
 ```yaml
 network:
@@ -89,31 +74,32 @@ network:
         - 10.20.0.3/24
 ```
 
-Set the correct permission:
+Apply on both (the `99-` prefix ensures these settings take priority over default Netplan files):
 
     sudo chmod 600 /etc/netplan/99-rdma.yaml
-
-Apply the changes:
-
     sudo netplan apply
 
-Verify the Ethernet cable (Cat6 or better) is connected between the two NICs. You should now be able to ping 10.20.0.3 from rdma1.
+Verify connectivity:
 
-Now that the physical Ethernet interfaces are persistently online with IP addresses, we can bind the Soft-RoCE driver to them.
+    ping 10.20.0.3   # from rdma1
 
-On rdma1:
+### Binding Soft-RoCE to the Interface
+
+With IP connectivity confirmed, bind the RXE device to the physical interface.
+
+On **rdma1:**
 
     sudo rdma link add rxe0 type rxe netdev enp7s0
 
-On rdma2:
+On **rdma2:**
 
     sudo rdma link add rxe0 type rxe netdev enp7s0
 
-The `rdma link add` command does not survive reboots natively. To make it persistent, we can create a systemd service file:
+### Making RXE Binding Persistent
 
-    sudo nano /etc/systemd/system/soft-roce.service
+The `rdma link add` command does not survive reboots. Create a systemd service on both workstations:
 
-Paste the following configuration:
+Create `/etc/systemd/system/soft-roce.service`:
 
 ```text
 [Unit]
@@ -123,7 +109,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Note: Check if your rdma path is /sbin/rdma or /usr/sbin/rdma using 'which rdma'
 ExecStart=/usr/bin/rdma link add rxe0 type rxe netdev enp7s0
 RemainAfterExit=yes
 
@@ -131,66 +116,54 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 ```
 
-Tell systemd to read your new file and enable it to run on boot:
+Enable and start:
 
     sudo systemctl daemon-reload
     sudo systemctl enable soft-roce.service
-
-Start it right now (or reboot):
-
     sudo systemctl start soft-roce.service
 
-Let's verify that the operating system has successfully mapped the new virtual device.
+### Verification
 
-Run on rdma1:
+Check that the RDMA subsystem sees the new device:
 
     rdma link show
 
-Sample output:
-
 ```text
-link ibp3s0/1 subnet_prefix fe80:0000:0000:0000 lid 1 sm_lid 1 lmc 0 state ACTIVE physical_state LINK_UP 
+link rocep3s0/1 state ACTIVE physical_state LINK_UP
 link rxe0/1 state ACTIVE physical_state LINK_UP netdev enp7s0
 ```
 
-Two RDMA devices are now visible. Each serves a fundamentally different role:
+Two RDMA devices are visible:
 
-- **ibp3s0** — This is the ConnectX-4's native InfiniBand Verbs interface. It is configured in InfiniBand mode (`LINK_TYPE_P1=IB`) with an EDR InfiniBand DAC cable connected between the two workstations. The state shows `ACTIVE` / `LINK_UP` with a valid LID assigned by the Subnet Manager, confirming the InfiniBand fabric is operational. This device is managed by the Mellanox `mlx5` driver and offloads RDMA operations directly to the NIC hardware, achieving true kernel bypass.
+- **rocep3s0** — The ConnectX-4 hardware RDMA device (configured for RoCEv2). All transport logic is offloaded to the NIC silicon.
+- **rxe0** — The Soft-RoCE device bound to `enp7s0`. All transport logic runs on the CPU via the `rdma_rxe` kernel module.
 
-- **rxe0** — This is the Soft-RoCE device we just created. It is a software emulation layer (`rdma_rxe`) bound to the Intel NIC's `enp7s0` interface. The state shows `ACTIVE` / `LINK_UP` because the underlying Ethernet interface is online with a valid IP address, and the `rdma_rxe` kernel module is successfully emulating the Verbs transport on top of it. Unlike `ibp3s0`, this device has no hardware RDMA offload — all transport logic runs on the CPU.
-
-Verify the RDMA subsystem sees it:
+Confirm with `ibv_devices`:
 
     ibv_devices
-
-Sample output:
 
 ```text
 device                 node GUID
 ------              ----------------
-ibp3s0              ec0d9a030044c34c
+rocep3s0            ec0d9a030044c34c
 rxe0                c66237fffe09dc78
 ```
 
 ## Capturing Soft-RoCE Traffic
 
-Now that our Soft-RoCE infrastructure is set up, capturing the traffic is straightforward. Because of how Soft-RoCE is architected, you do not need specialized Docker containers, custom OFED libraries, or hardware sniffer flags. Because the data traverses the standard Linux networking stack, you must point your packet sniffer at the physical OS interface (enp7s0), not the virtual RDMA device (rxe0).
+Because Soft-RoCE processes all RDMA packets through the standard Linux network stack, capturing traffic requires only native `tcpdump` on the physical interface — no specialized containers or OFED-aware tools needed.
 
-`rxe0` is your virtual RDMA Verbs device. Standard tcpdump operates at the OS networking level and cannot listen directly to the RDMA subsystem.
-
-`enp7s0` is the standard OS network interface that rxe0 is logically bound to (which you can verify by matching the interface MAC address to the rxe0 GUID). Because the Linux kernel ultimately pushes the Soft-RoCE UDP packets out of this physical port, this is where tcpdump must listen.
-
-To capture the RDMA traffic passing through your Soft-RoCE emulator, simply run standard tcpdump on your host machine against your physical Ethernet interface.
-
-We will apply a filter for UDP port 4791 (the globally recognized standard port for RoCEv2 traffic) to ensure we capture the RDMA payloads while ignoring background OS network chatter.
+Filter for UDP port 4791 (the standard RoCEv2 port):
 
     sudo tcpdump -i enp7s0 udp port 4791 -w soft_roce_capture.pcap
 
-Leave your tcpdump capture running in its current terminal. Open a second terminal window on rdma2 and start the ib_write_bw tool in "Listen" mode.
+## Running the Bandwidth Test
+
+On **rdma2** (server):
 
     ib_write_bw -d rxe0
 
-Now, switch over to your other workstation (rdma1). Fire the client command, pointing it at rdma2's IP address:
+On **rdma1** (client):
 
     ib_write_bw -d rxe0 10.20.0.3
 
@@ -224,6 +197,14 @@ Conflicting CPU frequency values detected: 1200.000000 != 3591.635000. CPU Frequ
 ---------------------------------------------------------------------------------------
 ```
 
-Once the benchmark completes, stop your tcpdump capture (Ctrl+C). Because the traffic was processed by the CPU and pushed through the standard OS network interface, you will have successfully captured every single RDMA payload in a standard .pcap format, ready to be opened and analyzed in Wireshark!
+Key differences from hardware RoCEv2:
 
-When an application sends data to your virtual RDMA device, the rdma_rxe software driver intercepts it, packages the RDMA payloads into standard UDP/IP packets, and hands them directly back to the standard Linux kernel's TCP/IP stack to be transmitted over the wire. Because the traffic flows through normal operating system pathways, it crosses the exact software hooks that standard packet sniffers monitor.
+| Field       | Soft-RoCE                     | Hardware RoCEv2 |
+|-------------|-------------------------------|-----------------|
+| ibv_wr* API | OFF (not supported by RXE)    | ON |
+| Mtu         | 1024[B] (limited by 1GbE MTU) | 4096[B] |
+| BW average  | 110.28 MB/sec (~0.88 Gb/s)    | 84.42 Gb/sec |
+
+The ~110 MB/s result is close to the 1GbE wire limit (~125 MB/s). The gap is due to CPU processing overhead and the UDP/IP/Ethernet encapsulation headers consuming bandwidth on a 1 Gb/s link.
+
+Stop the tcpdump capture (Ctrl+C). The resulting `.pcap` file contains every RDMA payload in standard format, ready for analysis in Wireshark.

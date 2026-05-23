@@ -32,7 +32,7 @@ This symmetric topology allows us to benchmark and compare all three RDMA transp
 - [Lab Setup](docs/05_README_SETUP.md): Hardware specifications, OS installation, and OFED driver deployment for both workstations.
 - [ConnectX-4 Configuration](docs/06_README_SETUP_CX_4.md): Detailed guide to the Mellanox MCX455A-ECAT - firmware configuration, VPI mode switching, and port provisioning.
 
-The VPI (Virtual Protocol Interconnect) designation means each ConnectX-4 port can be configured at the firmware level to operate in either InfiniBand mode or Ethernet mode. This is a per-port setting burned into the card's non-volatile memory. Because each link is point-to-point, both ends of a given pair **must** be configured to the same protocol: an InfiniBand port cannot negotiate a link with an Ethernet port. In our testbed, CX-4 #1 on both workstations is set to InfiniBand mode for native RDMA, while CX-4 #2 on both workstations is set to Ethernet mode for RoCEv2.
+The **VPI** (Virtual Protocol Interconnect) designation means each ConnectX-4 port can be configured at the firmware level to operate in either InfiniBand mode or Ethernet mode. This is a per-port setting burned into the card's non-volatile memory. Because each link is point-to-point, both ends of a given pair **must** be configured to the same protocol: an InfiniBand port cannot negotiate a link with an Ethernet port. In our testbed, CX-4 #1 on both workstations is set to InfiniBand mode for native RDMA, while CX-4 #2 on both workstations is set to Ethernet mode for RoCEv2.
 
 ## Testing the Testbed
 

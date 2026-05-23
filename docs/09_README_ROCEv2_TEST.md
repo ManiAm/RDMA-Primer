@@ -1,42 +1,45 @@
-
 # Configuring ConnectX-4 for RoCEv2 (100GbE)
 
-Before making configuration changes, it is important to understand how modern Mellanox hardware behaves when switched to Ethernet, and how the ConnectX-4 architecture differs fundamentally from older generations.
+This document covers switching a ConnectX-4 VPI adapter from InfiniBand mode to Ethernet mode, configuring it for RoCEv2 traffic, and verifying end-to-end RDMA over Ethernet. The ConnectX-4 is provisioned and MFT is running (see [ConnectX-4 Provisioning](06_README_SETUP_CX_4.md)).
 
-Firmware vs. OS Drivers: In older generations (like ConnectX-3), the hardware was a blank slate, and the Linux kernel driver (mlx4_core) dictated the port protocol via .conf files every time the machine booted. The ConnectX-4 architecture abandons this. The port configuration is burned directly into the card's non-volatile memory (NVRAM). The operating system's driver (mlx5_core) simply reads whatever the hardware is permanently set to. Therefore, you must use a firmware utility (mlxconfig) to permanently rewrite the card's internal settings.
+## Background
 
-The Protocol (RoCEv2): When you switch a ConnectX-4 port to Ethernet, it utilizes RoCEv2. Unlike older iterations that operated purely at Layer 2, RoCEv2 encapsulates the RDMA Verbs traffic inside standard UDP/IP packets. This means the traffic is fully routable across standard network switches and routers, making it highly flexible for modern data center designs.
+**Firmware-driven configuration:** Unlike older generations (ConnectX-3) where the OS driver dictated the port protocol on every boot, the ConnectX-4 stores the port mode permanently in NVRAM. The OS driver (`mlx5_core`) simply reads whatever the hardware is set to. Changes require `mlxconfig` and a reboot.
 
-The Speed: ConnectX-4 VPI card supports EDR InfiniBand (100 Gbps). When flipped to Ethernet mode, it supports the equivalent 100GbE standard, allowing you to push massive bandwidth over the exact same physical QSFP28 ports.
+**RoCEv2:** When a ConnectX-4 port is set to Ethernet mode, RDMA traffic is encapsulated inside standard UDP/IP packets (destination port 4791). This makes it fully routable across standard Ethernet switches, unlike native InfiniBand which requires a dedicated fabric.
 
-## Changing the Port Protocol (InfiniBand to Ethernet)
+**Speed:** The same QSFP28 port that delivers EDR InfiniBand (100 Gb/s) supports 100GBASE-CR4 Ethernet at the same speed.
 
-Check the current link type in the hardware's NVRAM using the Mellanox Firmware Tools (mlxconfig):
 
-    sudo mlxconfig -d /dev/mst/mt4115_pciconf1 query | grep LINK_TYPE
 
-Sample output:
+## Changing the Port Protocol
 
-        LINK_TYPE_P1                                IB(1)
+On **both workstations**, query the current link type:
 
-This tells us that Port 1 is currently configured for InfiniBand. To switch the port to Ethernet, use the `set` command and change the value to 2:
+    sudo mlxconfig -d /dev/mst/mt4115_pciconf0 query | grep LINK_TYPE
 
-    sudo mlxconfig -y -d /dev/mst/mt4115_pciconf1 set LINK_TYPE_P1=2
+```text
+LINK_TYPE_P1                                IB(1)
+```
 
-Because you just modified the hardware's core firmware parameters, a standard driver restart is not enough. You must reboot the machine so the motherboard's PCIe bus re-initializes the silicon.
+Switch to Ethernet:
+
+    sudo mlxconfig -y -d /dev/mst/mt4115_pciconf0 set LINK_TYPE_P1=2
+
+Reboot (required — the PCIe bus must re-initialize the silicon):
 
     sudo reboot
 
-## Verifying the Hardware Layer
 
-Once the machine comes back online, check the hardware state using ibstat:
+
+## Verifying the Hardware State
+
+After reboot, confirm the port is now operating as Ethernet:
 
     ibstat
 
-You should see output confirming the port is now operating natively as Ethernet:
-
 ```text
-CA 'rocep4s0'  <-------------------- (Notice the new name)
+CA 'rocep3s0'
         CA type: MT4115
         Number of ports: 1
         Firmware version: 12.28.2040
@@ -52,196 +55,143 @@ CA 'rocep4s0'  <-------------------- (Notice the new name)
                 SM lid: 0
                 Capability mask: 0x00010000
                 Port GUID: 0xee0d9afffe44c34c
-                Link layer: Ethernet  <--------------------
+                Link layer: Ethernet
 ```
 
-If you look at the very top of the output, you will notice the Channel Adapter (CA) name changed from ibp4s0 (or mlx5_X) to rocep4s0.
+Key changes from InfiniBand mode:
 
-This is a feature of modern Linux Predictable Network Interface Naming reacting to your firmware changes:
+| Field      | InfiniBand             | Ethernet (RoCEv2) |
+|------------|------------------------|-------------------|
+| CA name    | `ibp3s0` (prefix `ib`) | `rocep3s0` (prefix `roce`) |
+| Link layer | InfiniBand             | Ethernet |
+| Base lid   | 65535 (unconfigured)   | 0 (not applicable — Ethernet doesn't use LIDs) |
+| Rate       | 100 (EDR)              | 40 (default before cable negotiation) |
 
-When the port was in InfiniBand mode, the kernel prefixed the hardware Verbs device with ib (InfiniBand, PCI Bus 4, Slot 0).
+The `roce` prefix confirms the OS recognizes the card's RoCEv2 capabilities. Unlike InfiniBand, Ethernet does not require a Subnet Manager — the link becomes active as soon as a cable is connected and the interface is brought up.
 
-Now that you have permanently flashed the hardware to Ethernet mode, the mlx5_core driver recognizes it as a ROCE device. The OS dynamically updates the prefix to roce (RoCE, PCI Bus 4, Slot 0).
 
-This name change is a visual confirmation that your operating system is fully aware of the card's RoCEv2 capabilities, rather than just treating it as a generic Ethernet NIC.
 
-Unlike InfiniBand, Ethernet does not require a Subnet Manager (SM) to initialize the port. The moment a valid 100GbE cable is connected and the OS brings the interface up, the link is active.
+## Understanding the Dual Interfaces
 
-## Check Interfaces
+When a ConnectX-4 is configured for RoCEv2, the kernel presents two distinct views of the same physical port:
 
-Verify that Ubuntu recognizes the standard Ethernet interface using the `ip link show` command:
+| Interface             | Subsystem                 | Name       | Used By |
+|-----------------------|---------------------------|------------|---------|
+| OS network device     | Linux netdev (`ip link`)  | `ens4np0`  | Standard networking: IP addressing, MTU, firewall, ping, tcpdump |
+| Hardware Verbs device | RDMA/OFED (`ibv_devices`) | `rocep3s0` | RDMA operations: perftest, hardware counters, kernel-bypass traffic |
+
+**OS network interface (`ens4np0`):** Treats the ConnectX-4 like any Ethernet NIC. Traffic goes through the kernel TCP/IP stack. Use this name for `ip addr`, `ip link`, `ping`, `iperf3`, `tcpdump`.
+
+**Hardware Verbs device (`rocep3s0`):** Direct pipeline to the RDMA silicon. Traffic bypasses the kernel entirely. Use this name for `ib_write_bw`, `perfquery`, and RDMA-aware applications.
+
+Verify the Verbs device is present:
+
+```bash
+ibv_devices
+```
+
+```text
+device                 node GUID
+------              ----------------
+rocep3s0            ec0d9a030044c34c
+```
+
+
+## Inspecting OS Interfaces
 
     ip link show
 
-Sample output:
-
 ```text
-2: enp0s25: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+3: enp0s25: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
     link/ether d8:9e:f3:12:78:91 brd ff:ff:ff:ff:ff:ff
-3: ens4np0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+4: ens4np0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
     link/ether ec:0d:9a:44:c3:4c brd ff:ff:ff:ff:ff:ff
-    altname enp4s0np0
-4: ibs2: <BROADCAST,MULTICAST> mtu 4092 qdisc noop state DOWN mode DEFAULT group default qlen 256
-    link/infiniband 00:00:00:67:fe:80:00:00:00:00:00:00:98:03:9b:03:00:1b:79:a8 brd 00:ff:ff:ff:ff:12:40:1b:ff:ff:00:00:00:00:00:00:ff:ff:ff:ff
-    altname ibp3s0
+    altname enp3s0np0
 ```
 
-1. The Management Interface (`enp0s25`)
+| Interface | Type | Role |
+|-----------|------|------|
+| `enp0s25` | Ethernet (onboard) | Management network (SSH, internet). Standard 1 GbE. |
+| `ens4np0` | Ethernet (ConnectX-4) | The RoCEv2 port. Currently DOWN, awaiting configuration. |
 
-    What it is: This is your workstation's primary, built-in motherboard Ethernet port.
 
-    How to tell: It has a standard 6-byte MAC address (link/ether d8:9e...), standard 1500 MTU, and the state is actively UP and LOWER_UP, meaning a standard Cat6 cable is plugged in and providing your standard LAN/Internet connection.
 
-2. The Ethernet-Converted ConnectX-4 (`ens4np0`)
+## Network Configuration and Jumbo Frames
 
-    What it is: This is the ConnectX-4 port that we successfully flashed and switched to 100GbE mode using mlxconfig.
+For RoCEv2 to perform well, the MTU must be increased from the default 1500 to 9000 (Jumbo Frames). This reduces per-packet header overhead and allows the RDMA layer to use 4096-byte payloads efficiently.
 
-    How to tell: Notice that the protocol explicitly says link/ether and it has generated a standard 6-byte Ethernet MAC address (ec:0d:9a:44:c3:4c).
-
-    Current State: It is currently DOWN with the default mtu 1500. Before we can pass RoCEv2 traffic, we will need to bring this interface up, assign it an IP address, and increase that MTU to 9000 (Jumbo Frames).
-
-3. The Native InfiniBand ConnectX-4 (`ibs2`)
-
-    What it is: This is your second ConnectX-4 card, which was left untouched and is operating in native InfiniBand mode. Because standard TCP/IP cannot run natively over InfiniBand, the Linux kernel spun up this IP-over-InfiniBand (IPoIB) virtual interface to act as a translator.
-
-    How to tell: It is explicitly listed as link/infiniband. Instead of a MAC address, it uses a massive 20-byte hardware address that incorporates the port's unique Global Identifier (GUID: 98:03:9b...). The MTU is also set to the InfiniBand default of 4092.
-
-## The "Split-Brain" NIC: OS vs. Hardware Interfaces
-
-When you configure a ConnectX-4 card for RoCEv2, the Linux kernel initializes the hardware with a split-brain architecture. The card presents two distinct faces to the operating system: a standard software network interface, and a low-level hardware Verbs device. Understanding the distinction between these two interfaces is critical, as using the wrong name with the wrong tool will result in errors.
-
-### The OS Network Interface (`ens4np0`)
-
-This is the Linux Kernel Networking Stack's view of the port.
-
-When you run `ip link show`, you are interacting with the standard netdev (Network Device) subsystem.
-
-What it does: It treats your ConnectX-4 card exactly like a standard, cheap motherboard Ethernet port. Any traffic sent to ens4np0 goes through the host CPU, traverses the standard Linux TCP/IP stack, and is completely oblivious to the card's advanced hardware acceleration.
-
-When to use it: You must use the ens4np0 name anytime you are interacting with standard Linux networking tools or configuring the structural baseline of the network.
-
-- Assigning IP addresses (ip addr add...)
-- Changing MTU to Jumbo Frames (ip link set mtu 9000)
-- Configuring firewall rules (iptables / ufw)
-- Running standard TCP/IP troubleshooting (ping, ssh, standard iperf3)
-- Capturing non-RDMA traffic (tcpdump -i ens4np0)
-
-### The Hardware Verbs Device (`rocep4s0`)
-
-This is the RDMA Subsystem's view of the port.
-
-When you run ibv_devices, you are interacting with the OFED (OpenFabrics Enterprise Distribution) Verbs API.
-
-    ibv_devices
-
-    device                 node GUID
-    ------              ----------------
-    ibp3s0              506b4b0300eeae06
-    rocep4s0            ec0d9a030044c158
-
-What it does: This interface is the magic of RDMA. It represents a direct pipeline to the hardware silicon. When an application sends data to `rocep4s0`, the ConnectX-4 hardware pulls the data directly out of the application's user-space memory and puts it onto the wire. It completely bypasses the OS network interface (ens4np0), bypasses the Linux kernel, and utilizes zero CPU cycles.
-
-When to use it: You must use the `rocep4s0` name anytime you are running specialized RDMA software or hardware-level diagnostic tools.
-
-- Running RDMA bandwidth and latency benchmarks (ib_write_bw -d rocep4s0)
-- Querying hardware error counters (perfquery -C rocep4s0)
-- Running hardware-level packet sniffers (e.g., passing -i rocep4s0 to the Mellanox Docker tcpdump)
-- Configuring AI frameworks (like NVIDIA NCCL) or MPI clusters to use GPU-Direct RDMA.
-
-## OS Network Configuration and Jumbo Frames
-
-Before establishing the physical connection, we must configure the OS routing and increase the payload size. For 100GbE and RoCEv2/RDMA traffic to perform well, you must increase the Maximum Transmission Unit (MTU) from the default 1500 to 9000 (Jumbo Frames).
-
-On Workstation 1:
+On **Workstation 1:**
 
     sudo ip link set ens4np0 mtu 9000
     sudo ip addr add 10.10.0.1/24 dev ens4np0
     sudo ip link set ens4np0 up
 
-On Workstation 2:
+On **Workstation 2:**
 
     sudo ip link set ens4np0 mtu 9000
     sudo ip addr add 10.10.0.2/24 dev ens4np0
     sudo ip link set ens4np0 up
 
-Even though we just told the operating system to bring the interface online and assigned it an IP address, the physical circuit is still open because the DAC cable is not yet attached.
-
-If you check the interface right now, you will see a very specific, expected state:
+Before connecting the cable, verify the interface state:
 
 ```bash
 ip link show ens4np0
-
-3: ens4np0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 9000 qdisc mq state DOWN mode DEFAULT group default qlen 1000
-    link/ether ec:0d:9a:44:c3:4c brd ff:ff:ff:ff:ff:ff
-    altname enp4s0np0
 ```
 
-This output illustrates the split-brain nature of network interfaces:
+```text
+3: ens4np0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 9000 qdisc mq state DOWN mode DEFAULT group default qlen 1000
+    link/ether ec:0d:9a:44:c3:4c brd ff:ff:ff:ff:ff:ff
+```
 
-The Administrative State (UP): Look inside the angle brackets <... ,UP>. This confirms that your ip link set ens4np0 up command worked. The Linux kernel has administratively powered on the software interface and is ready to process packets.
+- **`UP`** (in angle brackets): The kernel has administratively enabled the interface.
+- **`NO-CARRIER`**: No cable detected — the QSFP28 port is empty.
+- **`mtu 9000`**: Jumbo Frames configured successfully.
 
-The Physical State (NO-CARRIER): Also inside the angle brackets, NO-CARRIER means the physical QSFP28 transceiver is not detecting an electrical signal. The port is empty, or the remote machine is powered off.
+This is the expected pre-cable state: software ready, waiting for physical connection.
 
-The Operational State (state DOWN): Because there is no physical carrier signal, the overarching operational state of the link remains DOWN. It cannot route traffic.
 
-The Payload Size (mtu 9000): This confirms that our Jumbo Frames configuration was successfully applied and saved.
 
-Seeing `<NO-CARRIER>` alongside UP is the exact confirmation you want before plugging in your 100GbE cable. It proves the software is fully prepped and simply waiting for the hardware to close the circuit.
+## Physical Connectivity
 
-## Physical Peer-to-Peer Connectivity
+Insert a QSFP28 DAC cable between the two workstations. Either cable works for RoCEv2 — at 100GbE both negotiate identically (see [Cable Selection](06_README_SETUP_CX_4.md#cable-selection)). This lab uses the MCP1600-C001E30N (Ethernet-labeled cable) for clarity.
 
-Insert a 100G QSFP28 Ethernet DAC between the ConnectX-4 ports. The Linux kernel will detect the carrier signal.
-
-Verify the physical link and MTU:
+Verify the link is up:
 
     ip addr show ens4np0
-
-Sample Output:
 
 ```text
 3: ens4np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 qdisc mq state UP mode DEFAULT group default qlen 1000
     link/ether ec:0d:9a:44:c3:4c brd ff:ff:ff:ff:ff:ff
-    altname enp4s0np0
+    altname enp3s0np0
 ```
 
-LOWER_UP: Confirms the physical layer (Layer 1) has successfully negotiated and the QSFP28 connection is electrically sound.
+- **`LOWER_UP`**: Physical layer (Layer 1) negotiated successfully — the cable is connected and both ends agreed on 100GbE.
+- **`state UP`**: Link is operational and ready for traffic.
 
-mtu 9000: Confirms Jumbo frames are active.
-
-## Test Basic Connectivity
-
-With the physical link up and IP addresses assigned, we can now test the connection.
-
-We will perform a standard ICMP ping to verify the basic OS network stack.
-
-ensure the two machines can ping each other over the new link. From Workstation 1, ping Workstation 2:
+Test basic IP connectivity:
 
     ping 10.10.0.2
 
-This confirms your IP routing and MAC address resolution (ARP) are working perfectly.
+
 
 ## Generating RoCEv2 Traffic
 
-To test true hardware-bypassed RDMA traffic, we use the perftest suite. Because we are using RoCEv2, the hardware uses the InfiniBand Verbs API under the hood, but encapsulates the payloads into standard Ethernet frames.
+With the link up and IP addresses assigned, test hardware RDMA over Ethernet using `ib_write_bw`:
 
-On Workstation 2 (The Server), start the listener:
+On **Workstation 2** (server):
 
-    ib_write_bw -d rocep4s0
+    ib_write_bw -d rocep3s0
 
-On Workstation 1 (The Client), initiate the traffic:
+On **Workstation 1** (client):
 
-    ib_write_bw -d rocep4s0 10.10.0.2 --report_gbits
-
-By appending the `--report_gbits` flag to the testing command, the perftest suite natively reports bandwidth in Gigabits per second (Gb/sec). This matches standard networking measurements and removes the need to manually convert from Megabytes per second.
-
-When the test completes, it outputs a detailed report of the connection parameters.
+    ib_write_bw -d rocep3s0 10.10.0.2 --report_gbits
 
 Sample output:
 
 ```text
 ---------------------------------------------------------------------------------------
                     RDMA_Write BW Test
- Dual-port       : OFF          Device         : rocep4s0
+ Dual-port       : OFF          Device         : rocep3s0
  Number of qps   : 1            Transport type : IB
  Connection type : RC           Using SRQ      : OFF
  PCIe relax order: ON
@@ -255,103 +205,94 @@ Sample output:
  rdma_cm QPs     : OFF
  Data ex. method : Ethernet
 ---------------------------------------------------------------------------------------
- local address: LID 0000 QPN 0x0106 PSN 0xd29890 RKey 0x17feed VAddr 0x0071b10617a000
+ local address: LID 0000 QPN 0x0106 PSN 0xda34b6 RKey 0x17feed VAddr 0x00761423c8a000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:00:01
- remote address: LID 0000 QPN 0x0106 PSN 0xfeb199 RKey 0x17feed VAddr 0x00718e149ef000
+ remote address: LID 0000 QPN 0x0106 PSN 0x2a7a40 RKey 0x17feed VAddr 0x007eb7460dd000
  GID: 00:00:00:00:00:00:00:00:00:00:255:255:10:10:00:02
 ---------------------------------------------------------------------------------------
  #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
-Conflicting CPU frequency values detected: 3491.920000 != 1200.000000. CPU Frequency is not max.
- 65536      5000             39.20              39.20              0.074769
+Conflicting CPU frequency values detected: 1200.000000 != 3491.633000. CPU Frequency is not max.
+ 65536      5000             84.42              84.42              0.161010
 ---------------------------------------------------------------------------------------
 ```
 
-Transport type: IB / Link type: Ethernet: This confirms the application is utilizing the native InfiniBand Verbs API, generating true RDMA traffic, but transporting it over a physical Ethernet layer.
+**Key fields:**
 
-GID Mapping: You can see how the hardware automatically mapped your IPv4 addresses (10:10:00:01) into the IPv6 GID format (::ffff:10:10:00:01).
+| Field          | Value              | Meaning |
+|----------------|--------------------|---------|
+| Transport type | IB                 | Using InfiniBand Verbs API (kernel bypass). |
+| Link type      | Ethernet           | Physical transport is Ethernet (RoCEv2). |
+| GID            | `::ffff:10.10.0.1` | IPv4 address mapped into IPv6 GID format. |
+| LID            | 0000               | Not applicable — Ethernet doesn't use LIDs. |
+| Mtu            | 4096[B]            | RDMA path MTU (maximum per-packet RDMA payload). |
+| BW average     | 84.42 Gb/sec       | Achieved throughput. |
 
-MTU: 4096: Because you enabled Jumbo Frames on the OS interface, the hardware can utilize large 4KB RDMA payloads, maximizing the 100GbE throughput and reducing header overhead.
+> **Note:** The CPU frequency warning (`Conflicting CPU frequency values detected`) indicates the governor is not set to `performance`. Setting it to `performance` on both nodes would likely push throughput closer to line rate (~93 Gb/s after protocol overhead).
+
+
 
 ## Capturing Hardware RoCEv2 Traffic
 
-Because RoCEv2 encapsulates its traffic inside standard UDP/IP packets, the most intuitive first step is to simply run standard Linux packet capture tools. If it is just UDP traffic on an Ethernet network, standard tcpdump should be able to see it, right? Unfortunately, capturing hardware-accelerated RDMA traffic is not that simple. If you attempt to use standard methods, you will run into two distinct roadblocks.
+RoCEv2 encapsulates RDMA inside UDP/IP packets, but the hardware bypasses the kernel during transfer. This creates a capture challenge.
 
-### Attempt 1: Sniffing the RDMA Device
+### Why Standard `tcpdump` Fails
 
-Because we know the RDMA traffic is tied to the Verbs device, your first instinct might be to tell tcpdump to listen directly to the hardware:
+**Attempt 1 — Capture on the Verbs device:**
 
-    sudo tcpdump -i rocep4s0
-
-However, you will get an error:
-
-```text
-libibverbs: Warning: couldn't open config directory '/etc/libibverbs.d'.
-tcpdump: rocep4s0: No such device exists
-(No such device exists)
+```bash
+sudo tcpdump -i rocep3s0
+# Error: rocep3s0: No such device exists
 ```
 
-This is because the standard tcpdump relies on the Linux kernel's libpcap library, which is strictly designed to hook into OS-level network interfaces (netdevs). Because rocep4s0 is a low-level hardware Verbs device, it is completely invisible to the standard OS networking stack. tcpdump simply doesn't know what it is.
+`tcpdump` uses libpcap, which only hooks into kernel netdev interfaces. The Verbs device is invisible to the kernel networking stack.
 
-### Attempt 2: Sniffing the OS Interface
+**Attempt 2 — Capture on the OS interface:**
 
-Since the hardware device didn't work, the next logical step is to run the capture against the standard OS Ethernet interface we configured earlier:
+```bash
+sudo tcpdump -i ens4np0 -w rocev2.pcap
+```
 
-    sudo tcpdump -i ens4np0 -w rocev2-bl.pcap
-
-This time the capture starts successfully. You open another terminal, run your ib_write_bw bandwidth test, and then stop the capture. However, when you open rocev2-bl.pcap in Wireshark, you will notice something strange: There is no high-speed RDMA payload. Instead, you will only see a brief burst of standard TCP/IP traffic, and then total silence.
+This captures successfully, but only shows a brief TCP handshake (the control plane exchange on port 18515). Once the RDMA data transfer begins, the capture goes silent — the HCA is pulling data directly from user-space memory to the wire, bypassing the kernel entirely.
 
 <img src="../pics/roce-initial.png" width="850"/>
 
-The TCP packets we captured are the initial Connection Management (CM) Handshake. Before blasting the high-speed RDMA traffic, the perftest tools use a standard TCP socket (usually over port 18515) to connect the two machines. During this brief handshake, the nodes exchange their InfiniBand parameters (GIDs, Queue Pair Numbers, and Packet Sequence Numbers). Because this handshake uses standard TCP sockets, it flows through the Linux kernel, and tcpdump successfully copies it.
+The TCP packets visible are the initial connection management handshake where the nodes exchange Queue Pair Numbers, GIDs, and Packet Sequence Numbers. After this, all data moves through the hardware bypass path.
 
-Once the control data is exchanged, the test shifts to the hardware layer, and the OS-level capture goes completely dark. This is the ultimate proof of Kernel Bypass. During the actual RoCEv2 data transfer, the ConnectX-4 card uses Direct Memory Access (DMA) to pull the payload straight from the user-space application memory and put it directly onto the physical wire. Because the data entirely bypasses the host CPU and the Linux networking stack, standard tcpdump physically cannot see the packets.
+### Solution: Offloaded Traffic Sniffer (Docker)
 
-### The Solution: Offloaded Traffic Sniffer
+To capture kernel-bypassed RoCEv2 packets, the NIC must be told to mirror traffic back to the OS. This requires a version of libpcap compiled with RDMA support (`--enable-rdma`). The simplest approach is the official Mellanox Docker container:
 
-To capture hardware RoCEv2 traffic, we must utilize the "Offloaded Traffic Sniffer" feature built into modern RDMA NICs. This feature tells the NIC's physical silicon to duplicate the kernel-bypassed packets and mirror them back up to the operating system so a sniffer can see them. To trigger this hardware mirror, we need a specially compiled version of libpcap with RDMA support enabled (`--enable-rdma`).
+Install Docker (if not already present):
 
-Rather than risking environment conflicts by compiling custom core networking libraries on your host machine, the industry-standard workaround is to use an official Docker container provided by Mellanox. This container includes the correct OFED drivers and a modified tcpdump binary out of the box, allowing you to hook directly into the hardware silicon.
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+newgrp docker
+```
 
-Make sure you have docker installed, if not install it
-
-    curl -fsSL https://get.docker.com | sudo sh
-
-and then:
-
-    sudo usermod -aG docker $USER
-
-make the changes:
-
-    newgrp docker
-
-Pull the Docker Image:
+Pull the RDMA-capable tcpdump image:
 
     docker pull mellanox/tcpdump-rdma
 
-Run the Container:
+Run the container with hardware access:
 
-You must run the container with --privileged and mount the InfiniBand character devices so the containerized tcpdump can talk directly to the NIC hardware. We also mount a local /tmp/traces directory to save the output file to the host machine.
-
-    docker run -it --net=host --privileged \
+```bash
+docker run -it --net=host --privileged \
     -v /dev/infiniband:/dev/infiniband \
     -v /tmp/traces:/tmp/traces \
     mellanox/tcpdump-rdma bash
+```
 
-2. To find the exact name of the RDMA device you need to sniff, run the standard Verbs device query command inside the container:
+Inside the container, verify the Verbs devices are accessible:
 
     ibv_devices
 
-    device                 node GUID
-    ------              ----------------
-    ibp3s0              506b4b0300eeae06
-    rocep4s0            ec0d9a030044c158
+Start the capture on the RoCEv2 device:
 
-3. Capture the Traffic:
+    tcpdump -i rocep3s0 -s 0 -w /tmp/traces/rocev2_capture.pcap
 
-Inside the container, run tcpdump rocep4s0.
-
-    tcpdump -i rocep4s0 -s 0 -w rocev2_capture.pcap
-
-While the capture is running, you can generate RDMA write traffic like before to verify the capture works.
+Generate RDMA traffic from another terminal (`ib_write_bw`), then stop the capture with Ctrl+C.
 
 <img src="../pics/rocev2-capture.png" width="850"/>
+
+The capture now shows the full RoCEv2 packet structure: Ethernet → IP → UDP (port 4791) → InfiniBand BTH → RDMA payload.
