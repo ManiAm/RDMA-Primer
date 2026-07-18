@@ -328,7 +328,7 @@ This package provides a suite of "micro-benchmarks" that talk directly to the Ve
 | Category     | Tool                         | Short Description                                                                 |
 | ------------ | ---------------------------- | --------------------------------------------------------------------------------- |
 | Send/Receive | `ib_send_bw`                 | Measures maximum throughput (Gbps) using the Send operation.                      |
-|              | `ib_send_lat`                | Measures round-trip latency (µs) using the Send operation.                        |
+|              | `ib_send_lat`                | Measures latency (µs) using the Send operation.                                   |
 | RDMA Write   | `ib_write_bw`                | Measures bandwidth for RDMA Write (direct memory placement on the remote node).   |
 |              | `ib_write_lat`               | Measures latency for RDMA Write operations.                                       |
 | RDMA Read    | `ib_read_bw`                 | Measures bandwidth for RDMA Read (reading from remote memory).                    |
@@ -341,6 +341,8 @@ This package provides a suite of "micro-benchmarks" that talk directly to the Ve
 |              | `raw_ethernet_burst_lat`     | Measures latency for bursts of raw Ethernet packets.                              |
 | Automation   | `run_perftest_loopback`      | Runs performance tests in local loopback mode (single NIC).                       |
 |              | `run_perftest_multi_devices` | Coordinates performance tests across multiple HCAs.                               |
+
+> All latency tools use a ping-pong pattern and report half-round-trip (one-way) latency. Each tool runs as a server/client pair — one instance on each end of the link.
 
 ### `mlnx-tools` Package
 

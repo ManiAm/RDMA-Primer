@@ -85,7 +85,7 @@ This mechanism allows the hardware to assemble or disassemble messages from non-
 
 Once memory is registered, protected, and instructions (WQEs) can be formatted, the application needs a mechanism to pass these instructions to the hardware. InfiniBand replaces standard socket APIs with a hardware-integrated, queue-based model. Crucially, queues do not hold payload data. They only hold the lightweight WQEs that point the HCA to the registered Memory Regions.
 
-- **Queue Pair (QP)**: The core communication endpoint, conceptually similar to a network socket. Every QP consists of two tightly coupled queues physically residing in pinned host memory but managed by the HCA:
+- **Queue Pair (QP)**: The core communication endpoint, conceptually similar to a network socket. Every QP consists of two tightly coupled queues physically residing in pinned *host memory* but managed by the HCA:
 
     - **Send Queue (SQ)**: The application posts outgoing WQEs here, instructing the HCA to perform actions like a standard Send, RDMA Write, or RDMA Read.
 
@@ -130,9 +130,9 @@ While Queue Pairs (QPs) provide the control mechanism through which the HCA rece
 
 **Two-Sided Operations** (Send/Receive)
 
-Two-sided operations in InfiniBand, consisting of Send and Receive commands, closely mirror the traditional messaging models found in standard TCP/IP networking. In this paradigm, a data transfer cannot occur in isolation; both the sender and the receiver must actively coordinate to complete the transaction. The process strictly dictates that the receiving application must prepare in advance by allocating a memory buffer and posting a "Receive" work request into its local RQ. Once the receiver is ready, the initiator can post a "Send" work request. The hardware then executes the transfer, marrying the incoming send operation to the receiver's pre-posted buffer.
+Two-sided operations in InfiniBand, consisting of Send and Receive commands, closely mirror the traditional messaging models found in standard TCP/IP networking. In this paradigm, a data transfer cannot occur in isolation; both the sender and the receiver must actively coordinate to complete the transaction. The process strictly dictates that the receiving application must prepare in advance by allocating a memory buffer and posting a "Receive" work request into its local RQ. Once the receiver is ready, the initiator can post a "Send" work request. The hardware then executes the transfer, matching the incoming send operation to the receiver's pre-posted buffer.
 
-> If the sender transmits data before the receiver has posted a matching Receive WQE, the receiver's HCA responds with a Receiver Not Ready (RNR) NAK in RC mode, causing the sender to back off and retry. In unreliable transports (UC/UD), the incoming message is silently dropped. We will go over transport services (RC, UC, UD) later.
+> If the sender transmits data before the receiver has posted a matching Receive WQE, the receiver's HCA responds with a Receiver Not Ready (RNR) NAK in RC mode, causing the sender to back off and retry. In unreliable transports (UC/UD), the incoming message is silently dropped.
 
 When the target HCA successfully places the incoming payload into the pre-allocated memory buffer, it generates a CQE. This entry acts as an alert to the receiver's CPU, notifying it that a new message has arrived and is ready to be consumed. Because this process forces the remote CPU to wake up and handle the notification, two-sided operations are not typically used for massive, bulk data transfers. Instead, they are suited for control-plane traffic, small synchronization events, or explicit state updates where the receiving application must be immediately aware of and actively react to new information.
 
@@ -153,7 +153,7 @@ As illustrated in the diagram, a two-sided operation requires active orchestrati
 
 One-sided operations, frequently referred to as "True RDMA," represent a fundamental departure from traditional messaging by allowing one node to directly access the memory of a remote node without any involvement from the remote CPU. In this model, the target system is entirely passive. The initiating node dictates the entire transaction by explicitly specifying the exact remote memory address it wishes to access, along with the required authorization token (the `R_Key`) to prove it has authorization. Depending on the need, the initiator uses this access to either "push" data directly into the remote memory (an RDMA Write) or "pull" data directly from it (an RDMA Read).
 
-The defining characteristic of a one-sided operation is the complete bypass of the target's processing hardware. When the request arrives across the fabric, the remote HCA validates the memory address and the `R_Key`, and then executes the memory transaction directly via DMA. Because it is a one-sided command, the remote HCA does not consume a Receive WQE, nor does it generate a local CQE. As a result, the target CPU is never interrupted, notified, or burdened. It remains completely oblivious to the fact that its memory was just read from or written to.
+The defining characteristic of a one-sided operation is the complete bypass of the target's host CPU. When the request arrives across the fabric, the remote HCA validates the memory address and the `R_Key`, and then executes the memory transaction directly via DMA. Because it is a one-sided command, the remote HCA does not consume a Receive WQE, nor does it generate a local CQE. As a result, the target CPU is never interrupted, notified, or burdened. It remains completely oblivious to the fact that its memory was just read from or written to.
 
 > The exception is **RDMA Write with Immediate Data**, a hybrid operation that carries a 32-bit immediate value alongside the RDMA payload. Because the receiver must be notified of the immediate value, this operation does consume a Receive WQE on the target and generates a CQE containing the immediate data. This makes it useful for signaling the completion of a data transfer without a separate control message.
 
@@ -201,7 +201,7 @@ To bypass this paradox, systems use an Out-of-Band (OOB) exchange. This simply m
 
 Before tracing the step-by-step timeline of connection setup, it is crucial to understand the exact data parameters the two nodes must swap over their out-of-band TCP connection.
 
-Regardless of the intended communication type, every InfiniBand connection requires exchanging four baseline values to establish a functional link. These include the **Queue Pair Number** (`qp_num`), which uniquely identifies the specific Queue Pair on the peer machine; the **LID**, which provides the link-layer address used by local switches to route packets; the **GID**, used for routing across different subnets; and the **Packet Sequence Number** (`PSN`), which establishes the starting sequence number to ensure precise packet ordering and enable loss detection.
+For connection-oriented transports (RC and UC), establishing a functional link requires exchanging four baseline values. These include the **Queue Pair Number** (`qp_num`), which uniquely identifies the specific Queue Pair on the peer machine; the **LID**, which provides the link-layer address used by local switches to route packets; the **GID**, used for routing across different subnets; and the **Packet Sequence Number** (`PSN`), which establishes the starting sequence number to ensure precise packet ordering and enable loss detection.
 
 If the applications intend to perform standard two-sided operations (Send/Receive), this baseline data is entirely sufficient. Because two-sided communication requires an active receiver that has already prepared a specific place in its own memory (via a Receive WQE) for the incoming data, the sender does not need to know the final memory destination.
 
@@ -252,13 +252,13 @@ When a QP is created in InfiniBand, it must be bound to a specific transport ser
 
 <img src="../pics/transport_service.png" width="550"/>
 
+> **TCP/IP analogy:** If you map these transports to familiar Internet protocols, **RC is the closest match to TCP** and **UD is the closest match to UDP**. RC is connection-oriented (1:1), reliable, and ordered — like TCP, but with those guarantees enforced in HCA hardware rather than in the host OS stack. UD is connectionless, unreliable, and datagram-oriented — like UDP — and a single UD QP can exchange messages with many peers (and can use multicast). **UC has no clean TCP/IP counterpart**: it is connected like TCP (dedicated 1:1 endpoints) but unreliable like UDP (no ACK/retry), so think of it as a connected fire-and-forget channel rather than as either TCP or UDP.
+
 **Reliable Connection (RC)** - The Gold Standard
 
 RC is the most widely used and feature-rich transport type in InfiniBand. It establishes a dedicated, point-to-point (1:1) connection between two QPs (one on each host). Once established, this connection behaves like a private, hardware-managed communication channel that guarantees *reliable*, *in-order* delivery of data.
 
-Reliability is enforced entirely in hardware. Each packet is assigned a PSN by the sender. The receiving HCA tracks these sequence numbers and detects any gaps, which indicate packet loss or corruption.
-
-RC uses **hardware acknowledgments** (ACKs) and a **Go-Back-N** retransmission mechanism. The receiver sends ACKs for successfully received packets. If an ACK is missing or an error is detected, the sender rewinds to the last acknowledged packet and retransmits all subsequent packets. Because of its strong guarantees, RC is the only transport that fully supports all operation types, including RDMA Reads and Atomics.
+Reliability is enforced entirely in hardware. Each packet is assigned a PSN by the sender. The receiving HCA tracks these sequence numbers and detects any gaps, which indicate packet loss or corruption. When loss is detected, the hardware triggers automatic retransmission using a [Go-Back-N](#go-back-n-retransmission) mechanism, ensuring that data is always delivered completely and in order. Because of these strong guarantees, RC is the only transport that fully supports all operation types, including RDMA Reads and Atomics.
 
 **Unreliable Connection (UC)**
 
@@ -276,11 +276,24 @@ Unlike RC, UD does not guarantee delivery, ordering, or reliability, and it only
 
 
 
+## InfiniBand MTU
+
+The Maximum Transmission Unit (MTU) in InfiniBand defines the maximum **payload** a single packet can carry across the fabric — not the total on-wire frame size (headers and CRCs are added on top). Unlike Ethernet, where the MTU is a continuous value configured per interface, InfiniBand restricts it to a small set of discrete sizes defined by the architecture: **256 B, 512 B, 1 KB, 2 KB, or 4 KB**.
+
+The active path MTU between two endpoints is negotiated during QP setup (it is set when the QP transitions to the RTR state). It must not exceed the capability of any port along the route. In practice, modern HCAs and switches all support 4096 bytes, making that the standard operating value in current fabrics.
+
+Two consequences follow from a fixed, relatively small MTU:
+
+1. A single UD (Unreliable Datagram) message cannot exceed one MTU, because UD has no segmentation mechanism.
+
+2. For RC and UC, the HCA transparently segments larger application messages into MTU-sized packets and reassembles them at the destination — a process described in the next section.
+
+
 ## Segmentation and Reassembly (SAR)
 
 With the transport services and communication semantics established, the next question is: what happens when an application message is larger than the network can carry in a single packet?
 
-InfiniBand applications often operate on massive data buffers (such as megabytes of memory). However, the underlying network can only transmit data in smaller, fixed units defined by the Maximum Transmission Unit (MTU) which in InfiniBand is strictly set to 256, 512, 1024, 2048, or 4096 bytes. To bridge this mismatch, the HCA implements Segmentation and Reassembly (SAR) entirely in hardware.
+InfiniBand applications often operate on massive data buffers (such as megabytes of memory). The HCA implements Segmentation and Reassembly (SAR) entirely in hardware to bridge the gap between application message sizes and the MTU.
 
 - **The Sending Side**: The HCA takes a large application message and automatically divides it into multiple smaller packets that fit perfectly within the MTU. These packets are transmitted across the fabric at full line rate.
 
@@ -312,7 +325,7 @@ While resending packets that were already successfully transmitted might seem in
 
 ## Virtual Lanes
 
-SAR and Go-Back-N address how data is segmented and recovered at the transport layer. The next set of mechanisms operate at the link layer, governing how traffic is organized, prioritized, and flow-controlled as it moves hop-by-hop through the fabric.
+SAR and Go-Back-N address how data is segmented and recovered at the transport layer. The next set of mechanisms operates at the link layer, governing how traffic is organized, prioritized, and flow-controlled as it moves hop-by-hop through the fabric.
 
 Virtual Lanes (VLs) are logical channels multiplexed over a single physical InfiniBand link. They are designed to provide traffic isolation, prevent head-of-line blocking, and enable quality of service (QoS) within the fabric. Instead of all traffic competing for the same buffers and transmission resources, each VL operates as an independent channel with its own buffering resources. This ensures that congestion in one lane does not stall traffic in others.
 
@@ -378,7 +391,7 @@ Credit-Based Flow Control is a proactive, hop-by-hop mechanism that operates at 
 
 - **Topology Changes and Flapping Links**: If a link goes down, the InfiniBand Subnet Manager (SM) must recalculate the routing tables. During this brief transition, packets already in flight may be routed to dead-end ports and discarded.
 
-> CBFC ensures the switch is ready to catch the ball, but it cannot prevent the ball from exploding in mid-air. This is why a transport-layer reliability mechanism like Go-Back-N (GBN) is required as an end-to-end safety net.
+> In short, CBFC prevents congestion-induced packet loss but cannot protect against physical-layer failures. This is why a transport-layer reliability mechanism like Go-Back-N is required as an end-to-end safety net.
 
 
 ## Congestion Control
@@ -454,7 +467,7 @@ In summary, LMC provides a hardware-friendly mechanism for multi-path utilizatio
 
 ## InfiniBand Switches (NVIDIA Quantum)
 
-InfiniBand switches are purpose-built for lossless, ultra-low-latency forwarding. Unlike Ethernet switches, they do not run distributed routing protocols. Instead, they act as simple, high-speed forwarding engines that execute precomputed [Linear Forwarding Tables (LFTs)](#core-responsibilities-the-sweep-process) programmed by the Subnet Manager, enforce [credit-based flow control](#flow-control) to guarantee zero packet loss, and support [adaptive routing](#lid-mask-control-lmc-flow-based-load-balancing) and congestion signaling ([FECN/BECN](#congestion-control)) to optimize traffic distribution across the fabric.
+InfiniBand switches are purpose-built for lossless, ultra-low-latency forwarding. Unlike Ethernet switches, they do not run distributed routing protocols. Instead, they act as simple, high-speed forwarding engines that execute precomputed [Linear Forwarding Tables (LFTs)](#core-responsibilities-the-sweep-process) programmed by the Subnet Manager, enforce [credit-based flow control](#flow-control) to prevent congestion-based packet loss, and support [multi-path forwarding](#lid-mask-control-lmc-flow-based-load-balancing) and congestion signaling ([FECN/BECN](#congestion-control)) to optimize traffic distribution across the fabric.
 
 NVIDIA's Quantum switch family is the dominant InfiniBand switching platform. The product line evolves alongside InfiniBand speed generations:
 
