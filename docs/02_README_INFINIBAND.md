@@ -115,8 +115,6 @@ The diagram below illustrates the complete end-to-end communication path between
 
 
 
-
-
 ### Communication Semantics: Operation Types
 
 While Queue Pairs (QPs) provide the control mechanism through which the HCA receives instructions, the protocol defines distinct methods or operations for moving data between the memory buffers of remote hosts. These operations dictate how much involvement is required from the remote hardware and CPU.
@@ -132,7 +130,7 @@ While Queue Pairs (QPs) provide the control mechanism through which the HCA rece
 
 Two-sided operations in InfiniBand, consisting of Send and Receive commands, closely mirror the traditional messaging models found in standard TCP/IP networking. In this paradigm, a data transfer cannot occur in isolation; both the sender and the receiver must actively coordinate to complete the transaction. The process strictly dictates that the receiving application must prepare in advance by allocating a memory buffer and posting a "Receive" work request into its local RQ. Once the receiver is ready, the initiator can post a "Send" work request. The hardware then executes the transfer, matching the incoming send operation to the receiver's pre-posted buffer.
 
-> If the sender transmits data before the receiver has posted a matching Receive WQE, the receiver's HCA responds with a Receiver Not Ready (RNR) NAK in RC mode, causing the sender to back off and retry. In unreliable transports (UC/UD), the incoming message is silently dropped.
+> If the sender transmits data before the receiver has posted a matching Receive WQE, the receiver's HCA responds with a Receiver Not Ready (RNR) NAK in Reliable Connection (RC) mode, causing the sender to back off and retry. In unreliable transports, the incoming message is silently dropped.
 
 When the target HCA successfully places the incoming payload into the pre-allocated memory buffer, it generates a CQE. This entry acts as an alert to the receiver's CPU, notifying it that a new message has arrived and is ready to be consumed. Because this process forces the remote CPU to wake up and handle the notification, two-sided operations are not typically used for massive, bulk data transfers. Instead, they are suited for control-plane traffic, small synchronization events, or explicit state updates where the receiving application must be immediately aware of and actively react to new information.
 
@@ -180,7 +178,7 @@ Atomic operations function as a specialized, highly synchronized extension of on
 
 - **Compare-and-Swap** (CAS): reads a remote 64-bit value and replaces it with a new one only if it matches an expected baseline.
 
-In both scenarios, the original value is invariably returned to the caller, allowing the application to determine whether its operation succeeded. Because atomics intrinsically require a response and strict packet ordering to function, they are exclusively supported over RC transports.
+In both scenarios, the original value is invariably returned to the caller, allowing the application to determine whether its operation succeeded. Because atomics intrinsically require a response and strict packet ordering to function, they are exclusively supported over Reliable Connection (RC) transports.
 
 The execution flow closely mirrors standard one-sided operations but enforces strict atomic guarantees at the memory level. The target system (Host B) first registers an 8-byte aligned memory region and shares its virtual address and `R_Key` with the initiator (Host A) through an out-of-band channel. To trigger the operation, Host A posts an Atomic Work Queue Element (WQE) to its Send Queue, detailing the remote address, the `R_Key`, and the specific operation parameters (such as the value to add or the compare/swap variables).
 
@@ -189,6 +187,57 @@ Host A's HCA transmits this request across the fabric. Upon arrival, Host B's HC
 Throughout this entire complex sequence, Host B's CPU remains completely oblivious and uninvolved, making this an exceptionally efficient mechanism for managing distributed locks, shared counters, and coordination flags in HPC and distributed databases.
 
 
+
+
+### Transport Services
+
+When a QP is created in InfiniBand, it must be bound to a specific transport service. This service defines how data is delivered, what guarantees are provided, and which communication semantics (one-sided, two-sided, or Atomic) are allowed. These transport types are implemented directly in the HCA, allowing applications to choose the appropriate balance between reliability, scalability, and performance.
+
+| Feature           | Reliable Connection (RC)  | Unreliable Connection (UC)         | Unreliable Datagram (UD)           |
+| ----------------- | ------------------------- | ---------------------------------- | ---------------------------------- |
+| Connection Type   | 1:1 (Dedicated)           | 1:1 (Dedicated)                    | 1:Many (Shared)                    |
+| Reliability       | Hardware ACKs and retries | None (packet loss results in drop) | None                               |
+| Max Message Size  | Up to 2 GB                | Up to 2 GB                         | Single MTU                         |
+| Send / Receive    | Supported                 | Supported                          | Supported                          |
+| RDMA Write        | Supported                 | Supported                          | Not supported                      |
+| RDMA Read         | Supported                 | Not supported                      | Not supported                      |
+| Atomic Operations | Supported                 | Not supported                      | Not supported                      |
+
+<img src="../pics/transport_service.png" width="550"/>
+
+> **TCP/IP analogy:** If you map these transports to familiar Internet protocols, **RC is the closest match to TCP** and **UD is the closest match to UDP**. RC is connection-oriented (1:1), reliable, and ordered — like TCP, but with those guarantees enforced in HCA hardware rather than in the host OS stack. UD is connectionless, unreliable, and datagram-oriented — like UDP — and a single UD QP can exchange messages with many peers (and can use multicast). **UC has no clean TCP/IP counterpart**: it is connected like TCP (dedicated 1:1 endpoints) but unreliable like UDP (no ACK/retry), so think of it as a connected fire-and-forget channel rather than as either TCP or UDP.
+
+**Reliable Connection (RC)** - The Gold Standard
+
+RC is the most widely used and feature-rich transport type in InfiniBand. It establishes a dedicated, point-to-point (1:1) connection between two QPs (one on each host). Once established, this connection behaves like a private, hardware-managed communication channel that guarantees *reliable*, *in-order* delivery of data.
+
+Reliability is enforced entirely in hardware. Each packet is assigned a PSN by the sender. The receiving HCA tracks these sequence numbers and detects any gaps, which indicate packet loss or corruption. When loss is detected, the hardware triggers automatic retransmission using a [Go-Back-N](#go-back-n-retransmission) mechanism, ensuring that data is always delivered completely and in order. Because of these strong guarantees, RC is the only transport that fully supports all operation types, including RDMA Reads and Atomics.
+
+**Unreliable Connection (UC)**
+
+UC serves as a strategic middle ground within the InfiniBand transport suite. Like RC, it establishes a dedicated point-to-point (1:1) link between two endpoints; however, it intentionally strips away the processing overhead of hardware acknowledgments and retransmissions. If a packet is lost or corrupted in the fabric, the HCA simply drops it without attempting any form of recovery.
+
+This "fire-and-forget" architecture strictly dictates which operations the transport can support. For instance, RDMA Writes are fully supported because they are inherently one-way transactions; the sender simply pushes data to the network and moves on, neither needing nor expecting a response. Conversely, RDMA Reads are fundamentally unsupported. An RDMA Read intrinsically requires a two-way exchange: a request packet sent out to the target, and a payload of data packets returned. Because UC lacks acknowledgment, timeout, and retry mechanisms, a dropped packet in either direction would leave the initiating HCA hanging indefinitely, waiting for a response that will never arrive.
+
+By sacrificing guaranteed delivery to eliminate latency overhead, UC becomes highly efficient for workloads where pure speed outweighs perfect data integrity such as raw video streaming, high-frequency telemetry, or applications designed to manage their own reliability logic at the software level.
+
+**Unreliable Datagram (UD)**
+
+UD provides a connection-less communication model, similar in spirit to UDP in traditional networking. A single UD QP can communicate with multiple peers, enabling one-to-many or many-to-one communication patterns without requiring dedicated connections for each endpoint.
+
+Unlike RC, UD does not guarantee delivery, ordering, or reliability, and it only supports two-sided Send operations (no RDMA). Its maximum message size is limited to a single MTU. This makes UD extremely lightweight and efficient, as it avoids the overhead associated with maintaining connection state. UD is typically used for control-plane traffic, such as subnet management, discovery protocols, and multicast communication.
+
+
+
+### QP Ownership and Multi-QP Transfers
+
+A Queue Pair is not a system-provided resource that appears automatically. The **application** is solely responsible for creating QPs by calling the Verbs API (`ibv_create_qp`), specifying the transport type, queue depths, and associated Completion Queues. The application owns the QP for its entire lifetime and decides how to use it.
+
+This ownership model gives the application full control over how data is submitted to the network. Consider an application that needs to transfer 1 GB of data to a remote peer:
+
+- **Single QP**: The application can post the entire 1 GB as one or more Work Requests on a single QP. The HCA transparently segments the data into MTU-sized packets through [Segmentation and Reassembly (SAR)](#segmentation-and-reassembly-sar), transmits them in order, and the remote HCA reassembles the original buffer. This is the simplest approach — one connection, one path through the fabric, one stream of sequenced packets.
+
+- **Multiple QPs**: Alternatively, the application can create several QPs to the same destination, partition the 1 GB buffer into independent chunks (for example, four 256 MB segments), and post each chunk on a separate QP. Each QP operates as an independent connection with its own packet sequence space. Refer to [QP Scaling](https://github.com/ManiAm/GNS-DC-Load-Balancing/blob/master/03_README_ROCE_LB.md) for more details.
 
 
 ### Connection Setup: Out-of-Band Exchange
@@ -233,46 +282,6 @@ Manually writing code to open TCP sockets and swap these exact variables is the 
 - **RDMA CM** (`librdmacm`): This is an abstraction library that handles the entire setup for you. It automatically resolves addresses, creates the QPs, manages the state transitions, and performs the exchange behind the scenes using a familiar socket-like API (e.g., `rdma_connect` / `rdma_accept`).
 
 - **High-Level Frameworks**: If you are using parallel computing or AI frameworks like MPI, UCX, or NVIDIA's NCCL, they have their own internal bootstrap mechanisms. They completely hide the out-of-band exchange from the end user, allowing you to focus purely on sending and receiving data.
-
-
-
-### Transport Services
-
-When a QP is created in InfiniBand, it must be bound to a specific transport service. This service defines how data is delivered, what guarantees are provided, and which communication semantics (one-sided, two-sided, or Atomic) are allowed. These transport types are implemented directly in the HCA, allowing applications to choose the appropriate balance between reliability, scalability, and performance.
-
-| Feature           | Reliable Connection (RC)  | Unreliable Connection (UC)         | Unreliable Datagram (UD)           |
-| ----------------- | ------------------------- | ---------------------------------- | ---------------------------------- |
-| Connection Type   | 1:1 (Dedicated)           | 1:1 (Dedicated)                    | 1:Many (Shared)                    |
-| Reliability       | Hardware ACKs and retries | None (packet loss results in drop) | None                               |
-| Max Message Size  | Up to 2 GB                | Up to 2 GB                         | Single MTU                         |
-| Send / Receive    | Supported                 | Supported                          | Supported                          |
-| RDMA Write        | Supported                 | Supported                          | Not supported                      |
-| RDMA Read         | Supported                 | Not supported                      | Not supported                      |
-| Atomic Operations | Supported                 | Not supported                      | Not supported                      |
-
-<img src="../pics/transport_service.png" width="550"/>
-
-> **TCP/IP analogy:** If you map these transports to familiar Internet protocols, **RC is the closest match to TCP** and **UD is the closest match to UDP**. RC is connection-oriented (1:1), reliable, and ordered — like TCP, but with those guarantees enforced in HCA hardware rather than in the host OS stack. UD is connectionless, unreliable, and datagram-oriented — like UDP — and a single UD QP can exchange messages with many peers (and can use multicast). **UC has no clean TCP/IP counterpart**: it is connected like TCP (dedicated 1:1 endpoints) but unreliable like UDP (no ACK/retry), so think of it as a connected fire-and-forget channel rather than as either TCP or UDP.
-
-**Reliable Connection (RC)** - The Gold Standard
-
-RC is the most widely used and feature-rich transport type in InfiniBand. It establishes a dedicated, point-to-point (1:1) connection between two QPs (one on each host). Once established, this connection behaves like a private, hardware-managed communication channel that guarantees *reliable*, *in-order* delivery of data.
-
-Reliability is enforced entirely in hardware. Each packet is assigned a PSN by the sender. The receiving HCA tracks these sequence numbers and detects any gaps, which indicate packet loss or corruption. When loss is detected, the hardware triggers automatic retransmission using a [Go-Back-N](#go-back-n-retransmission) mechanism, ensuring that data is always delivered completely and in order. Because of these strong guarantees, RC is the only transport that fully supports all operation types, including RDMA Reads and Atomics.
-
-**Unreliable Connection (UC)**
-
-UC serves as a strategic middle ground within the InfiniBand transport suite. Like RC, it establishes a dedicated point-to-point (1:1) link between two endpoints; however, it intentionally strips away the processing overhead of hardware acknowledgments and retransmissions. If a packet is lost or corrupted in the fabric, the HCA simply drops it without attempting any form of recovery.
-
-This "fire-and-forget" architecture strictly dictates which operations the transport can support. For instance, RDMA Writes are fully supported because they are inherently one-way transactions; the sender simply pushes data to the network and moves on, neither needing nor expecting a response. Conversely, RDMA Reads are fundamentally unsupported. An RDMA Read intrinsically requires a two-way exchange: a request packet sent out to the target, and a payload of data packets returned. Because UC lacks acknowledgment, timeout, and retry mechanisms, a dropped packet in either direction would leave the initiating HCA hanging indefinitely, waiting for a response that will never arrive.
-
-By sacrificing guaranteed delivery to eliminate latency overhead, UC becomes highly efficient for workloads where pure speed outweighs perfect data integrity such as raw video streaming, high-frequency telemetry, or applications designed to manage their own reliability logic at the software level.
-
-**Unreliable Datagram (UD)**
-
-UD provides a connection-less communication model, similar in spirit to UDP in traditional networking. A single UD QP can communicate with multiple peers, enabling one-to-many or many-to-one communication patterns without requiring dedicated connections for each endpoint.
-
-Unlike RC, UD does not guarantee delivery, ordering, or reliability, and it only supports two-sided Send operations (no RDMA). Its maximum message size is limited to a single MTU. This makes UD extremely lightweight and efficient, as it avoids the overhead associated with maintaining connection state. UD is typically used for control-plane traffic, such as subnet management, discovery protocols, and multicast communication.
 
 
 
@@ -335,7 +344,7 @@ Each Virtual Lane operates as an independent flow control domain, meaning that b
 
 Among these lanes, certain VLs have special roles. VL0 is the default data lane used for standard traffic when no explicit QoS policy is applied. Additional lanes (VL1 through VL14) are available for traffic classification and prioritization.
 
-A particularly important lane is VL15, which is reserved exclusively for management traffic. It is used by the Subnet Manager to send control messages (such as topology discovery and configuration) through a dedicated queue pair (QP0) that exists on every InfiniBand port. VL15 is given the highest priority and is isolated from normal data traffic, ensuring that control-plane communication remains functional even under heavy load.
+A particularly important lane is VL15, which is reserved exclusively for fabric management traffic. It carries the highest priority and is fully isolated from data VLs, ensuring that management communication remains functional even under severe congestion. Its role is described in the [Subnet Manager](#subnet-manager-sm-the-brain-of-the-infiniband-fabric) section.
 
 <img src="../pics/virtual-lanes.png" width="700"/>
 
